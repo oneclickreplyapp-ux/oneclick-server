@@ -4,6 +4,10 @@ const Stripe = require("stripe");
 
 const app = express();
 
+// ===== In-memory Pro storage (MVP) =====
+const proUsers = new Set();
+
+// ===== Environment Keys =====
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -11,6 +15,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
    STRIPE WEBHOOK (ДОЛЖЕН БЫТЬ ДО express.json())
 ===================================================== */
 app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+
   const sig = req.headers["stripe-signature"];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -24,8 +29,14 @@ app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
   }
 
   if (event.type === "checkout.session.completed") {
+
     const session = event.data.object;
-    console.log("Payment successful for session:", session.id);
+    const userId = session.metadata?.userId;
+
+    if (userId) {
+      proUsers.add(userId);
+      console.log("Pro activated for user:", userId);
+    }
   }
 
   res.json({ received: true });
@@ -45,9 +56,24 @@ app.get("/", (req, res) => {
 });
 
 /* =====================================================
+   CHECK PRO STATUS
+===================================================== */
+app.get("/check-pro", (req, res) => {
+
+  const { userId } = req.query;
+
+  if (proUsers.has(userId)) {
+    return res.json({ isPro: true });
+  }
+
+  res.json({ isPro: false });
+});
+
+/* =====================================================
    OPENAI GENERATE
 ===================================================== */
 app.post("/generate", async (req, res) => {
+
   try {
     const { emailText, type } = req.body || {};
 
@@ -100,8 +126,7 @@ app.post("/generate", async (req, res) => {
     }
 
     const data = await response.json();
-    const reply =
-      data?.choices?.[0]?.message?.content || "No reply generated.";
+    const reply = data?.choices?.[0]?.message?.content || "No reply generated.";
 
     res.json({ reply });
 
@@ -115,7 +140,10 @@ app.post("/generate", async (req, res) => {
    STRIPE CHECKOUT SESSION
 ===================================================== */
 app.post("/create-checkout-session", async (req, res) => {
+
   try {
+
+    const { userId } = req.body;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -124,14 +152,15 @@ app.post("/create-checkout-session", async (req, res) => {
         {
           price_data: {
             currency: "usd",
-            product_data: {
-              name: "OneClick Reply Pro"
-            },
+            product_data: { name: "OneClick Reply Pro" },
             unit_amount: 1200
           },
           quantity: 1
         }
       ],
+      metadata: {
+        userId: userId
+      },
       success_url: "https://oneclick-server-uur2.onrender.com/success",
       cancel_url: "https://oneclick-server-uur2.onrender.com/cancel"
     });
@@ -163,4 +192,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
