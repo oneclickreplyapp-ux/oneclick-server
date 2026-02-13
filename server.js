@@ -1,3 +1,9 @@
+const { createClient } = require("@supabase/supabase-js");
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
@@ -14,7 +20,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 /* =====================================================
    STRIPE WEBHOOK (ДОЛЖЕН БЫТЬ ДО express.json())
 ===================================================== */
-app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
 
   const sig = req.headers["stripe-signature"];
   const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -34,8 +40,21 @@ app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
     const userId = session.metadata?.userId;
 
     if (userId) {
-      proUsers.add(userId);
-      console.log("Pro activated for user:", userId);
+      try {
+
+        const { error } = await supabase
+          .from("users")
+          .upsert({ id: userId, is_pro: true });
+
+        if (error) {
+          console.error("Supabase error:", error);
+        } else {
+          console.log("Pro activated for user:", userId);
+        }
+
+      } catch (dbError) {
+        console.error("Database crash:", dbError);
+      }
     }
   }
 
