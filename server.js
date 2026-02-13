@@ -1,169 +1,194 @@
 const { createClient } = require("@supabase/supabase-js");
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
 const express = require("express");
 const cors = require("cors");
 const Stripe = require("stripe");
 
 const app = express();
 
-// ===== In-memory Pro storage (MVP) =====
-const proUsers = new Set();
+// ===== Environment variables =====
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-// ===== Environment Keys =====
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const XAI_API_KEY = process.env.XAI_API_KEY;
+
+if (!XAI_API_KEY) {
+  console.error("CRITICAL ERROR: XAI_API_KEY is missing or empty in environment variables!");
+  process.exit(1);
+}
+
+console.log(`[START] XAI_API_KEY detected (length: ${XAI_API_KEY.length} chars)`);
 
 /* =====================================================
-   STRIPE WEBHOOK (ДОЛЖЕН БЫТЬ ДО express.json())
+   STRIPE WEBHOOK
 ===================================================== */
-app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  const sig = req.headers["stripe-signature"];
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+      console.log(`Webhook verified | Type: ${event.type}`);
+    } catch (err) {
+      console.error("Webhook signature failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
 
-  let event;
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const userId = session.metadata?.userId;
 
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  } catch (err) {
-    console.error("Webhook signature verification failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
+      if (!userId) {
+        console.warn("No userId in metadata");
+        return res.json({ received: true });
+      }
 
-  if (event.type === "checkout.session.completed") {
+      console.log(`Payment success for user: ${userId}`);
 
-    const session = event.data.object;
-    const userId = session.metadata?.userId;
-
-    if (userId) {
       try {
-
         const { error } = await supabase
           .from("users")
-          .upsert({ id: userId, is_pro: true });
+          .upsert(
+            { id: userId, is_pro: true, updated_at: new Date().toISOString() },
+            { onConflict: "id" }
+          );
 
-        if (error) {
-          console.error("Supabase error:", error);
-        } else {
-          console.log("Pro activated for user:", userId);
-        }
-
-      } catch (dbError) {
-        console.error("Database crash:", dbError);
+        if (error) console.error("Supabase upsert failed:", error.message);
+        else console.log(`Pro activated for ${userId}`);
+      } catch (dbErr) {
+        console.error("Database error in webhook:", dbErr);
       }
     }
-  }
 
-  res.json({ received: true });
-});
+    res.json({ received: true });
+  }
+);
 
 /* =====================================================
-   NORMAL MIDDLEWARE
+   Middleware
 ===================================================== */
 app.use(cors());
 app.use(express.json());
 
-/* =====================================================
-   ROOT
-===================================================== */
-app.get("/", (req, res) => {
-  res.send("OK");
-});
+app.get("/", (req, res) => res.send("OneClick Server OK"));
 
 /* =====================================================
    CHECK PRO STATUS
 ===================================================== */
-app.get("/check-pro", (req, res) => {
+app.post("/check-pro", async (req, res) => {
+  const { userId } = req.body;
 
-  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "userId required" });
 
-  if (proUsers.has(userId)) {
-    return res.json({ isPro: true });
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .select("is_pro")
+      .eq("id", userId)
+      .single();
+
+    if (error && error.code !== "PGRST116") {
+      console.error("Supabase check-pro error:", error);
+      return res.status(500).json({ isPro: false });
+    }
+
+    const isPro = data?.is_pro ?? false;
+    res.json({ isPro });
+  } catch (err) {
+    console.error("check-pro crash:", err);
+    res.json({ isPro: false });
   }
-
-  res.json({ isPro: false });
 });
 
 /* =====================================================
-   OPENAI GENERATE
+   GENERATE AI REPLY — ONLY GROK (xAI)
 ===================================================== */
 app.post("/generate", async (req, res) => {
+  const { emailText, type } = req.body || {};
+
+  if (!emailText) return res.status(400).json({ error: "emailText required" });
+
+  let instruction = "";
+  switch (type) {
+    case "followup":
+      instruction = "Write a short, polite follow-up email based on the previous conversation.";
+      break;
+    case "confident":
+      instruction = "Rewrite this email to sound more confident, assertive, and professional.";
+      break;
+    case "polite":
+      instruction = "Rewrite this email to be extremely polite, friendly, and courteous.";
+      break;
+    case "shorten":
+      instruction = "Shorten and clarify this email while keeping the main points and professional tone.";
+      break;
+    default:
+      instruction = "Write a clear, professional, and concise reply to this incoming email.";
+  }
 
   try {
-    const { emailText, type } = req.body || {};
+    console.log(`[GENERATE] Request | type=${type} | text_length=${emailText.length}`);
 
-    let instruction = "";
-
-    switch (type) {
-      case "followup":
-        instruction = "Write a short and polite follow-up email.";
-        break;
-      case "confident":
-        instruction = "Rewrite this email to sound confident and professional.";
-        break;
-      case "polite":
-        instruction = "Rewrite this email to sound polite and friendly.";
-        break;
-      case "shorten":
-        instruction = "Rewrite this email to be shorter and clearer.";
-        break;
-      default:
-        instruction = "Write a professional reply to this inbound email.";
-    }
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://api.x.ai/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENAI_API_KEY}`
+        "Authorization": `Bearer ${XAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: "gpt-4.1-mini",
+        model: "grok-4-1-fast-non-reasoning",
         messages: [
           {
             role: "system",
-            content: "You are a professional sales assistant. Keep replies concise."
+            content: "You are a helpful professional email assistant. Keep replies concise, natural, and business-appropriate."
           },
           {
             role: "user",
-            content: `${instruction}\n\n${emailText || ""}`
+            content: `${instruction}\n\nEmail content:\n${emailText}`
           }
         ],
-        temperature: 0.5,
-        max_tokens: 200
+        temperature: 0.6,
+        max_tokens: 600
       })
     });
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error("OpenAI error:", errText);
-      return res.status(500).json({ error: "OpenAI failed" });
+      console.error(`[GROK FAIL] status=${response.status} | body=${errText}`);
+      return res.status(500).json({ error: `Grok API error: ${response.status}` });
     }
 
     const data = await response.json();
-    const reply = data?.choices?.[0]?.message?.content || "No reply generated.";
+    const reply = data?.choices?.[0]?.message?.content?.trim() || "";
 
+    if (!reply) {
+      console.warn("[GROK] Empty content returned");
+      return res.status(503).json({ error: "Grok returned empty response" });
+    }
+
+    console.log(`[GROK SUCCESS] reply length: ${reply.length}`);
     res.json({ reply });
-
   } catch (error) {
-    console.error("Generate crash:", error);
-    res.status(500).json({ error: "AI generation failed" });
+    console.error("[GENERATE CRASH]", error.message);
+    res.status(500).json({ error: "Sorry, server error occurred. Please try again later." });
   }
 });
 
 /* =====================================================
-   STRIPE CHECKOUT SESSION
+   STRIPE CHECKOUT + SUCCESS/CANCEL
 ===================================================== */
 app.post("/create-checkout-session", async (req, res) => {
+  const { userId } = req.body;
+
+  if (!userId) return res.status(400).json({ error: "userId required" });
 
   try {
-
-    const { userId } = req.body;
-
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       payment_method_types: ["card"],
@@ -171,43 +196,36 @@ app.post("/create-checkout-session", async (req, res) => {
         {
           price_data: {
             currency: "usd",
-            product_data: { name: "OneClick Reply Pro" },
-            unit_amount: 1200
+            product_data: { name: "OneClick Reply Pro - Lifetime" },
+            unit_amount: 1200,
           },
-          quantity: 1
-        }
+          quantity: 1,
+        },
       ],
-      metadata: {
-        userId: userId
-      },
-      success_url: "https://oneclick-server-uur2.onrender.com/success",
-      cancel_url: "https://oneclick-server-uur2.onrender.com/cancel"
+      metadata: { userId },
+      success_url: `${process.env.SERVER_URL || "https://oneclick-server-uur2.onrender.com"}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.SERVER_URL || "https://oneclick-server-uur2.onrender.com"}/cancel`,
     });
 
     res.json({ url: session.url });
-
   } catch (error) {
-    console.error("Stripe error:", error);
-    res.status(500).json({ error: "Stripe failed" });
+    console.error("Stripe create session error:", error);
+    res.status(500).json({ error: "Failed to create checkout session" });
   }
 });
 
-/* =====================================================
-   SUCCESS / CANCEL
-===================================================== */
 app.get("/success", (req, res) => {
-  res.send("Payment successful. You can close this tab.");
+  res.send("<h2>Payment successful!</h2><p>You are now Pro. Close this tab.</p>");
 });
 
 app.get("/cancel", (req, res) => {
-  res.send("Payment canceled.");
+  res.send("<h2>Payment canceled.</h2><p>Try again later.</p>");
 });
 
 /* =====================================================
-   SERVER START
+   START SERVER
 ===================================================== */
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 OneClick server running on port ${PORT}`);
 });
